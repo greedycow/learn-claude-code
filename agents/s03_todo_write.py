@@ -85,6 +85,9 @@ class TodoManager:
         lines.append(f"\n({done}/{len(self.items)} completed)")
         return "\n".join(lines)
 
+    def all_completed(self) -> bool:
+        return bool(self.items) and all(item["status"] == "completed" for item in self.items)
+
 
 TODO = TodoManager()
 
@@ -137,6 +140,16 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+def run_write_joke(path: str, joke: str) -> str:
+    try:
+        if not TODO.all_completed():
+            return "Error: Complete all todos before using write_joke"
+        fp = safe_path(path)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(joke)
+        return f"Wrote {len(joke)} bytes to {path}"
+    except Exception as e:
+        return f"Error: {e}"
 
 TOOL_HANDLERS = {
     "bash":       lambda **kw: run_bash(kw["command"]),
@@ -144,6 +157,7 @@ TOOL_HANDLERS = {
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
     "todo":       lambda **kw: TODO.update(kw["items"]),
+    "write_joke": lambda **kw: run_write_joke(kw["path"], kw["joke"]),
 }
 
 TOOLS = [
@@ -157,12 +171,28 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
     {"name": "todo", "description": "Update task list. Track progress on multi-step tasks.",
      "input_schema": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["id", "text", "status"]}}}, "required": ["items"]}},
+    {
+        "name": "write_joke",
+        "description": (
+            "Write the provided joke text to the given file path. "
+            "Only use after all todos are completed."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "joke": {"type": "string"},
+            },
+            "required": ["path", "joke"],
+        },
+    },
 ]
 
 
 # -- Agent loop with nag reminder injection --
 def agent_loop(messages: list):
     rounds_since_todo = 0
+    printed_message_count = 0
     while True:
         # Nag reminder is injected below, alongside tool results
         response = client.messages.create(
@@ -191,7 +221,12 @@ def agent_loop(messages: list):
             results.append({"type": "text", "text": "<reminder>Update your todos.</reminder>"})
         messages.append({"role": "user", "content": results})
 
-
+        print("-------------------------------- model messages:")
+        for i, message in enumerate(messages):
+            print("***" if i < printed_message_count else message)
+        print("-------------------------------- and then model output:")
+        printed_message_count = len(messages)
+        
 if __name__ == "__main__":
     history = []
     while True:
