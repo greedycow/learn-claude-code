@@ -39,9 +39,18 @@ WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
+SYSTEM = (
+    f"You are a coding agent at {WORKDIR}. "
+    "Use the task tool to delegate exploration or subtasks. "
+    "MUST USE sub_review to ask an independent reviewer to inspect work."
+)
 SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
-
+REVIEWER_SYSTEM = f"""You are an independent code reviewer at {WORKDIR}.
+Review the requested work with fresh context.
+Prioritize bugs, risks, regressions, and missing validation/tests.
+Use read-only tools only. Do not modify files.
+Return a concise review with findings first. Include file paths and line numbers when possible.
+If you find no issues, say "No findings." and mention any residual risk briefly."""
 
 # -- Tool implementations shared by parent and child --
 def safe_path(p: str) -> Path:
@@ -63,6 +72,16 @@ def run_bash(command: str) -> str:
         return "Error: Timeout (120s)"
     except (FileNotFoundError, OSError) as e:
         return f"Error: {e}"
+
+def run_review_bash(command: str) -> str:
+    blocked = [
+        ">", ">>", "rm ", "mv ", "cp ", "touch ", "mkdir ", "rmdir ",
+        "git checkout", "git reset", "git clean", "git apply", "sed -i",
+        "perl -i", "tee ", "install ",
+    ]
+    if any(token in command for token in blocked):
+        return "Error: Reviewer bash is read-only"
+    return run_bash(command)
 
 def run_read(path: str, limit: int = None) -> str:
     try:
@@ -101,6 +120,11 @@ TOOL_HANDLERS = {
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
 }
 
+REVIEWER_TOOL_HANDLERS = {
+    "bash":      lambda **kw: run_review_bash(kw["command"]),
+    "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
+}
+
 # Child gets all base tools except task (no recursive spawning)
 CHILD_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
@@ -111,6 +135,13 @@ CHILD_TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in file.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+]
+
+REVIEWER_TOOLS = [
+    {"name": "bash", "description": "Run a shell command for read-only inspection such as rg, ls, git diff, or pytest.",
+     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+    {"name": "read_file", "description": "Read file contents.",
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
 ]
 
 
@@ -129,21 +160,48 @@ def run_subagent(prompt: str) -> str:
         for block in response.content:
             if block.type == "tool_use":
                 handler = TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                try:
+                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                except Exception as e:
+                    output = f"Error: {e}"
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
         sub_messages.append({"role": "user", "content": results})
     # Only the final text returns to the parent -- child context is discarded
     return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
 
+def run_reviewer(prompt: str) -> str:
+    review_messages = [{"role": "user", "content": prompt}]  # fresh context
+    for _ in range(30):  # safety limit
+        response = client.messages.create(
+            model=MODEL, system=REVIEWER_SYSTEM, messages=review_messages,
+            tools=REVIEWER_TOOLS, max_tokens=8000,
+        )
+        review_messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            break
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                handler = REVIEWER_TOOL_HANDLERS.get(block.name)
+                try:
+                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                except Exception as e:
+                    output = f"Error: {e}"
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
+        review_messages.append({"role": "user", "content": results})
+    return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no review)"
 
 # -- Parent tools: base tools + task dispatcher --
 PARENT_TOOLS = CHILD_TOOLS + [
     {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
      "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}},
+    {"name": "sub_review", "description": "Spawn an independent reviewer with fresh context. It inspects work and returns findings only.",
+     "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the review"}}, "required": ["prompt"]}},
 ]
 
 
 def agent_loop(messages: list):
+    printed_message_count = 0
     while True:
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
@@ -158,14 +216,26 @@ def agent_loop(messages: list):
                 if block.name == "task":
                     desc = block.input.get("description", "subtask")
                     prompt = block.input.get("prompt", "")
-                    print(f"> task ({desc}): {prompt[:80]}")
+                    print(f"> task ({desc}): {prompt[:800]}")
                     output = run_subagent(prompt)
+                elif block.name == "sub_review":
+                    desc = block.input.get("description", "review")
+                    prompt = block.input.get("prompt", "")
+                    print(f"> sub_review ({desc}): {prompt[:800]}")
+                    output = run_reviewer(prompt)
                 else:
                     handler = TOOL_HANDLERS.get(block.name)
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 print(f"  {str(output)[:200]}")
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
         messages.append({"role": "user", "content": results})
+
+        print("--------------------------------")
+        for i, message in enumerate(messages):
+            print("***" if i < printed_message_count else message)
+        print("--------------------------------")
+        printed_message_count = len(messages)
+        
 
 
 if __name__ == "__main__":
